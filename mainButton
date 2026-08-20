@@ -1,0 +1,501 @@
+import SwiftUI
+import AVFoundation
+
+// MARK: - Models & Enums
+enum CellState {
+    case empty, occupied, clearing
+}
+
+// MARK: - Game Manager (State & Logic)
+class GameManager: ObservableObject {
+    @Published var board: [[CellState]] = Array(repeating: Array(repeating: .empty, count: 8), count: 8)
+    @Published var score: Int = 0
+    @AppStorage("bestScore") var bestScore: Int = 0 
+    @Published var currentPieces: [[[Bool]]] = []
+    @Published var isProcessing: Bool = false
+    @Published var floatingMessage: String = ""
+    
+    // Rastreador de apuntado (Punto Rojo)
+    @Published var hoverRow: Int? = nil
+    @Published var hoverCol: Int? = nil
+    @Published var hoverPiece: [[Bool]]? = nil
+    
+    // Alertas
+    @Published var showPerfectClear: Bool = false
+    @Published var showGameOver: Bool = false
+    
+    var audioPlayer: AVAudioPlayer?
+    
+    let shapes: [[[Bool]]] = [
+        [[true, true, true, true]], // I
+        [[true, true], [true, true]], // O
+        [[false, true, false], [true, true, true]], // T
+        [[true, false, false], [true, true, true]], // J
+        [[false, false, true], [true, true, true]], // L
+        [[false, true, true], [true, true, false]], // S
+        [[true, true, false], [false, true, true]]  // Z
+    ]
+    
+    init() {
+        generatePieces()
+    }
+    
+    func generatePieces() {
+        var newPieces: [[[Bool]]] = []
+        for _ in 0..<3 {
+            newPieces.append(shapes.randomElement()!)
+        }
+        currentPieces = newPieces
+    }
+    
+    func rotateMatrix(_ matrix: [[Bool]]) -> [[Bool]] {
+        let rows = matrix.count
+        let cols = matrix[0].count
+        var rotated = Array(repeating: Array(repeating: false, count: rows), count: cols)
+        
+        for r in 0..<rows {
+            for c in 0..<cols {
+                rotated[c][rows - 1 - r] = matrix[r][c]
+            }
+        }
+        return rotated
+    }
+    
+    func rotatePiece(at index: Int) {
+        guard !isProcessing else { return }
+        currentPieces[index] = rotateMatrix(currentPieces[index])
+    }
+    
+    func canPlace(row: Int, col: Int, piece: [[Bool]]) -> Bool {
+        for r in 0..<piece.count {
+            for c in 0..<piece[0].count {
+                if piece[r][c] {
+                    let targetRow = row + r
+                    let targetCol = col + c
+                    if targetRow < 0 || targetRow >= 8 || targetCol < 0 || targetCol >= 8 || board[targetRow][targetCol] != .empty {
+                        return false
+                    }
+                }
+            }
+        }
+        return true
+    }
+    
+    func placePiece(row: Int, col: Int, piece: [[Bool]], pieceIndex: Int) {
+        if isProcessing || !canPlace(row: row, col: col, piece: piece) { return }
+        
+        isProcessing = true
+        var newBoard = board
+        for r in 0..<piece.count {
+            for c in 0..<piece[0].count {
+                if piece[r][c] {
+                    newBoard[row + r][col + c] = .occupied
+                }
+            }
+        }
+        board = newBoard
+        currentPieces.remove(at: pieceIndex)
+        updateScore(points: 10)
+        
+        checkAndClearLines()
+    }
+    
+    func updateScore(points: Int) {
+        score += points
+        if score > bestScore {
+            bestScore = score
+        }
+    }
+    
+    func checkAndClearLines() {
+        var rowsToClear: [Int] = []
+        var colsToClear: [Int] = []
+        
+        for i in 0..<8 {
+            if board[i].allSatisfy({ $0 == .occupied }) { rowsToClear.append(i) }
+            
+            var colFull = true
+            for r in 0..<8 {
+                if board[r][i] != .occupied { colFull = false; break }
+            }
+            if colFull { colsToClear.append(i) }
+        }
+        
+        let totalLines = rowsToClear.count + colsToClear.count
+        
+        if totalLines > 0 {
+            var animBoard = board
+            for r in rowsToClear { for c in 0..<8 { animBoard[r][c] = .clearing } }
+            for c in colsToClear { for r in 0..<8 { animBoard[r][c] = .clearing } }
+            board = animBoard
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                var finalBoard = self.board
+                for r in 0..<8 {
+                    for c in 0..<8 {
+                        if finalBoard[r][c] == .clearing { finalBoard[r][c] = .empty }
+                    }
+                }
+                self.board = finalBoard
+                
+                let basePoints = totalLines * 100
+                let comboBonus = totalLines > 1 ? (totalLines - 1) * 100 : 0
+                let pointsScored = basePoints + comboBonus
+                
+                self.updateScore(points: pointsScored)
+                
+                if totalLines > 1 {
+                    self.showFloatingMessage("¡COMBO X\(totalLines)!\n+\(pointsScored)")
+                }
+                
+                self.evaluateTurnEnd(totalLines: totalLines)
+            }
+        } else {
+            evaluateTurnEnd(totalLines: 0)
+        }
+    }
+    
+    func evaluateTurnEnd(totalLines: Int) {
+        let isPerfectClear = board.allSatisfy { row in row.allSatisfy { $0 == .empty } }
+        
+        if totalLines > 0 && isPerfectClear {
+            showPerfectClear = true
+        } else {
+            finalizeTurn()
+        }
+    }
+    
+    func finalizeTurn() {
+        if currentPieces.isEmpty { generatePieces() }
+        if isGameOver() { handleGameOver() }
+        isProcessing = false
+    }
+    
+    func showFloatingMessage(_ message: String) {
+        floatingMessage = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            if self.floatingMessage == message {
+                self.floatingMessage = ""
+            }
+        }
+    }
+    
+    func canPieceFitAnywhere(_ piece: [[Bool]]) -> Bool {
+        var pieceToTest = piece
+        for _ in 0..<4 {
+            for r in 0..<8 {
+                for c in 0..<8 {
+                    if canPlace(row: r, col: c, piece: pieceToTest) { return true }
+                }
+            }
+            pieceToTest = rotateMatrix(pieceToTest)
+        }
+        return false
+    }
+    
+    func isGameOver() -> Bool {
+        for piece in currentPieces {
+            if canPieceFitAnywhere(piece) { return false }
+        }
+        return true
+    }
+    
+    func handleGameOver() {
+        isProcessing = true
+        playGameOverSound()
+        showGameOver = true
+    }
+    
+    func playGameOverSound() {
+        guard let url = Bundle.main.url(forResource: "game_over", withExtension: "mp3") else { return }
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.play()
+        } catch {
+            print("Error reproduciendo audio: \(error)")
+        }
+    }
+    
+    func restartGame(bonus: Int = 0) {
+        updateScore(points: bonus)
+        score = 0
+        board = Array(repeating: Array(repeating: .empty, count: 8), count: 8)
+        generatePieces()
+        isProcessing = false
+    }
+}
+
+// MARK: - Main View
+struct BlockGameView: View {
+    @StateObject private var game = GameManager()
+    @State private var gridFrame: CGRect = .zero 
+    
+    // Estado para forzar el layout
+    @State private var forceLandscape: Bool = false
+    
+    var body: some View {
+        GeometryReader { geo in
+            let traySize: CGFloat = 160.0
+            
+            ZStack {
+                Color(red: 0.9, green: 0.72, blue: 0.5)
+                    .ignoresSafeArea()
+                
+                VStack(spacing: 0) {
+                    // Header con el botón de cambio de vista
+                    HStack {
+                        Text("Best: \(game.bestScore)")
+                            .font(.headline).bold()
+                        
+                        Spacer()
+                        
+                        // Botón para alternar el layout
+                        Button(action: {
+                            withAnimation {
+                                forceLandscape.toggle()
+                            }
+                        }) {
+                            Image(systemName: forceLandscape ? "rectangle.portrait" : "rectangle.landscape")
+                                .foregroundColor(.white)
+                                .padding(8)
+                                .background(Color(red: 0.24, green: 0.15, blue: 0.13))
+                                .cornerRadius(8)
+                        }
+                        
+                        Spacer()
+                        
+                        Text("Score: \(game.score)")
+                            .font(.headline).bold()
+                    }
+                    .padding()
+                    
+                    if forceLandscape {
+                        HStack {
+                            boardArea(geo: geo, isLandscape: true, traySize: traySize)
+                            trayArea(isLandscape: true, traySize: traySize)
+                        }
+                    } else {
+                        VStack {
+                            boardArea(geo: geo, isLandscape: false, traySize: traySize)
+                            trayArea(isLandscape: false, traySize: traySize)
+                        }
+                    }
+                }
+            }
+            .alert("¡PERFECT CLEAR!", isPresented: $game.showPerfectClear) {
+                Button("Seguir (+1000 pts)") {
+                    game.updateScore(points: 1000)
+                    game.showFloatingMessage("¡PERFECT!\n+1000")
+                    game.finalizeTurn()
+                }
+                Button("Reiniciar (+5000 pts)") {
+                    game.restartGame(bonus: 5000)
+                }
+            } message: {
+                Text("Has vaciado completamente el tablero.\nElige tu recompensa:")
+            }
+            .alert("¡GAME OVER!", isPresented: $game.showGameOver) {
+                Button("Jugar de Nuevo") {
+                    game.restartGame()
+                }
+            } message: {
+                Text("No hay más movimientos posibles.\nPuntuación Final: \(game.score)")
+            }
+        }
+        // Eliminamos el .coordinateSpace(name: "globalScene")
+    }
+    
+    // MARK: - Tablero
+    private func boardArea(geo: GeometryProxy, isLandscape: Bool, traySize: CGFloat) -> some View {
+        let boardMargin: CGFloat = 16
+        let availableWidth = isLandscape ? (geo.size.width - traySize) : geo.size.width
+        let availableHeight = isLandscape ? geo.size.height - 50 : (geo.size.height - 50 - traySize)
+        let maxDimension = min(availableWidth, availableHeight) - (boardMargin * 2)
+        let cellSize = maxDimension / 8
+        
+        return ZStack {
+            VStack(spacing: 0) {
+                ForEach(0..<8, id: \.self) { r in
+                    HStack(spacing: 0) {
+                        ForEach(0..<8, id: \.self) { c in
+                            let state = game.board[r][c]
+                            
+                            let isHovered: Bool = {
+                                guard let hRow = game.hoverRow, let hCol = game.hoverCol, let hPiece = game.hoverPiece else { return false }
+                                let pr = r - hRow
+                                let pc = c - hCol
+                                if pr >= 0 && pr < hPiece.count && pc >= 0 && pc < hPiece[0].count {
+                                    return hPiece[pr][pc]
+                                }
+                                return false
+                            }()
+                            
+                            ZStack {
+                                Rectangle()
+                                    // Mejor contraste y piezas azules
+                                    .fill(state == .clearing ? Color.white : (state == .occupied ? Color.blue : Color.white.opacity(0.15)))
+                                    .cornerRadius(4)
+                                    .shadow(color: state == .clearing ? .white : .clear, radius: 5)
+                                
+                                if isHovered && state == .empty {
+                                    Circle()
+                                        .fill(Color.red)
+                                        .frame(width: 12, height: 12)
+                                }
+                            }
+                            .padding(1.5) // Grid más definido
+                            .frame(width: cellSize, height: cellSize)
+                            .animation(.easeInOut(duration: 0.15), value: state)
+                        }
+                    }
+                }
+            }
+            .padding(boardMargin)
+            .background(Color.black) // Fondo puro negro para el tablero
+            .cornerRadius(8)
+            .background(
+                GeometryReader { innerGeo in
+                    Color.clear.onAppear {
+                        // Cambiamos a coordenadas .global absolutas
+                        self.gridFrame = innerGeo.frame(in: .global)
+                    }
+                    .onChange(of: innerGeo.frame(in: .global)) { oldFrame, newFrame in
+                        self.gridFrame = newFrame
+                    }
+                }
+            )
+            
+            if !game.floatingMessage.isEmpty {
+                Text(game.floatingMessage)
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundColor(.yellow)
+                    .shadow(color: .black, radius: 5)
+                    .multilineTextAlignment(.center)
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.3), value: game.floatingMessage)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    
+    // MARK: - Bandeja de Piezas
+    private func trayArea(isLandscape: Bool, traySize: CGFloat) -> some View {
+        let maxDimension = min(UIScreen.main.bounds.width, UIScreen.main.bounds.height) - 32
+        let cellSize = maxDimension / 8
+        
+        let content = ForEach(Array(game.currentPieces.enumerated()), id: \.offset) { index, piece in
+            VStack {
+                PieceDraggableView(piece: piece, index: index, cellSize: cellSize, gridFrame: gridFrame, game: game)
+                
+                Button(action: { game.rotatePiece(at: index) }) {
+                    Image(systemName: "arrow.clockwise")
+                        .foregroundColor(.brown)
+                        .padding(8)
+                }
+                .disabled(game.isProcessing)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        
+        return Group {
+            if isLandscape {
+                VStack(spacing: 10) { content }.frame(width: traySize)
+            } else {
+                HStack(spacing: 10) { content }.frame(height: traySize)
+            }
+        }
+    }
+}
+
+// MARK: - Componente Arrastrable (Pieza)
+struct PieceDraggableView: View {
+    let piece: [[Bool]]
+    let index: Int
+    let cellSize: CGFloat
+    let gridFrame: CGRect
+    @ObservedObject var game: GameManager
+    
+    @State private var dragOffset: CGSize = .zero
+    @State private var isDragging: Bool = false
+    
+    var body: some View {
+        let visualSize = (cellSize - 2)
+        
+        VStack(spacing: 0) {
+            ForEach(0..<piece.count, id: \.self) { r in
+                HStack(spacing: 0) {
+                    ForEach(0..<piece[0].count, id: \.self) { c in
+                        Rectangle()
+                            .fill(piece[r][c] ? Color.blue : Color.clear)
+                            .cornerRadius(4 * (isDragging ? 1.0 : 0.5))
+                            .padding(1 * (isDragging ? 1.0 : 0.5))
+                            .frame(
+                                width: visualSize * (isDragging ? 1.0 : 0.5),
+                                height: visualSize * (isDragging ? 1.0 : 0.5)
+                            )
+                    }
+                }
+            }
+        }
+        .opacity(isDragging ? 0.8 : 1.0)
+        .offset(dragOffset)
+        .gesture(
+            // Utilizamos el espacio de coordenadas .global para un rastreo infalible
+            DragGesture(coordinateSpace: .global)
+                .onChanged { value in
+                    guard !game.isProcessing else { return }
+                    isDragging = true
+                    dragOffset = value.translation
+                    
+                    let dropLocation = value.location
+                    let pieceWidth = CGFloat(piece[0].count) * cellSize
+                    let pieceHeight = CGFloat(piece.count) * cellSize
+                    
+                    let adjustedX = dropLocation.x - (pieceWidth / 2)
+                    let adjustedY = dropLocation.y - (pieceHeight / 2)
+                    
+                    let relativeX = adjustedX - gridFrame.minX
+                    let relativeY = adjustedY - gridFrame.minY
+                    
+                    let col = Int(round(relativeX / cellSize))
+                    let row = Int(round(relativeY / cellSize))
+                    
+                    if row >= -2 && row <= 8 && col >= -2 && col <= 8 {
+                        game.hoverRow = row
+                        game.hoverCol = col
+                        game.hoverPiece = piece
+                    }
+                }
+                .onEnded { value in
+                    guard !game.isProcessing else { return }
+                    isDragging = false
+                    
+                    game.hoverRow = nil
+                    game.hoverCol = nil
+                    game.hoverPiece = nil
+                    
+                    let dropLocation = value.location
+                    let pieceWidth = CGFloat(piece[0].count) * cellSize
+                    let pieceHeight = CGFloat(piece.count) * cellSize
+                    
+                    let adjustedX = dropLocation.x - (pieceWidth / 2)
+                    let adjustedY = dropLocation.y - (pieceHeight / 2)
+                    
+                    let relativeX = adjustedX - gridFrame.minX
+                    let relativeY = adjustedY - gridFrame.minY
+                    
+                    let col = Int(round(relativeX / cellSize))
+                    let row = Int(round(relativeY / cellSize))
+                    
+                    if row >= -2 && row <= 8 && col >= -2 && col <= 8 {
+                        game.placePiece(row: row, col: col, piece: piece, pieceIndex: index)
+                    }
+                    
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                        dragOffset = .zero
+                    }
+                }
+        )
+        .zIndex(isDragging ? 10 : 1)
+    }
+}
